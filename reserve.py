@@ -22,7 +22,7 @@ def get_username():
     return result.stdout.strip()
 
 GPUInfo = namedtuple('GPUInfo', ['index', 'name'])
-ProcInfo = namedtuple('ProcInfo', ['pid', 'user', 'gpu_index', 'start_time'])
+ProcInfo = namedtuple('ProcInfo', ['pid', 'user', 'gpu_index', 'start_time', 'preemption_candidate'])
 
 def get_gpu_infos():
     # use `nvidia-smi --help-query-gpu` to get all query options
@@ -153,31 +153,22 @@ def make_arg_parser():
     parser.add_argument('command', nargs='*', help="command to run")
     return parser
 
-def main():
-    args = make_arg_parser().parse_args()
-    lock_directory = os.path.join(lock_base_directory, get_hostname())
-    user = get_username()
+def try_launch(args, lock_directory):
+    gpus = get_gpu_infos()
+    gpu_processes = get_gpu_processes()
+    process_users = get_process_users()
 
-    with open(os.path.join(lock_directory, 'privileged_users'), 'r') as f:
-        privileged_users = f.read().split()
+    users_with_reservation = []
+    all_start_times = get_process_starts()
 
-    def try_launch():
-        gpus = get_gpu_infos()
-        gpu_processes = get_gpu_processes()
-        process_users = get_process_users()
+    reserved_processes_by_user = defaultdict(list)
 
-        users_with_reservation = []
-        all_start_times = get_process_starts()
-
-        reserved_processes_by_user = defaultdict(list)
-
-        for gpu, gpu_info in gpus.items():
-            if args.large_mem and '8000' not in gpu_info.name:
-                continue
-            elif not args.large_mem and '8000' in gpu_info.name:
-                continue
-            fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
-            used_by = get_locking_pid(fn)
+    for gpu, gpu_info in gpus.items():
+        can_run = ((args.large_mem and '8000' in gpu_info.name) or 
+                    (not args.large_mem and '8000' not in gpu_info.name))
+        fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
+        used_by = get_locking_pid(fn)
+        if can_run:
             while used_by is None:
                 if len(gpu_processes[gpu]) > 0:
                     process_infos = ' '.join(['{}:{}'.format(pid, process_users[pid]) for pid in gpu_processes[gpu]])
@@ -198,31 +189,48 @@ def main():
                     print('Failed to aquire lock on gpu', gpu_info.index)
                 used_by = get_locking_pid(fn)
 
+        if used_by is not None:
             reserved_processes_by_user[process_users[used_by]].append(ProcInfo(
                 pid=used_by,
                 user=process_users[used_by],
                 gpu_index=gpu_info.index,
                 start_time=all_start_times[used_by],
+                preemption_candidate=can_run,
             ))
-        return reserved_processes_by_user
+    return reserved_processes_by_user
 
-    reserved_processes_by_user = try_launch()
+def main():
+    args = make_arg_parser().parse_args()
+    lock_directory = os.path.join(lock_base_directory, get_hostname())
+    user = get_username()
+
+    with open(os.path.join(lock_directory, 'privileged_users'), 'r') as f:
+        privileged_users = f.read().split()
+
+    reserved_processes_by_user = try_launch(args, lock_directory)
     print('All gpus reserved')
     user_reservation_counts = {
         user: len(procs)
         for user, procs in reserved_processes_by_user.items()
     }
+    user_reservation_counts_usable = {
+        user: len([p for p in procs if p.preemption_candidate])
+        for user, procs in reserved_processes_by_user.items()
+    }
     print('Users with a reservation:', user_reservation_counts)
-    if user in privileged_users and user not in user_reservation_counts:
+    print('Users with a reservation on usable gpus:', user_reservation_counts_usable)
+    if user in privileged_users and user not in user_reservation_counts_usable:
+    #if user in privileged_users:
         reserved = list(reserved_processes_by_user.items())
         # shuffle before sorting to break ties non-deterministically
         random.shuffle(reserved)
         for user_to_boot, users_processes in sorted(reserved, key=lambda tpl: len(tpl[1])):
-            boot = False
-            if ((user_to_boot in privileged_users and len(users_processes) > MINIMUM_PRIVELIGED_JOBS) or
-                (user_to_boot not in privileged_users and len(users_processes) > MINIMUM_NON_PRIVELIGED_JOBS)):
-                # preempt the newest process by this user
-                process_to_preempt = max(users_processes, key=lambda pinfo: pinfo.start_time)
+            preemption_candidates = [proc_info for proc_info in users_processes if proc_info.preemption_candidate]
+            over_minimum = ((user_to_boot in privileged_users and len(users_processes) > MINIMUM_PRIVELIGED_JOBS) or
+                            (user_to_boot not in privileged_users and len(users_processes) > MINIMUM_NON_PRIVELIGED_JOBS))
+            if preemption_candidates and over_minimum:
+                # preempt the newest preemptable process by this user
+                process_to_preempt = max(preemption_candidates, key=lambda pinfo: pinfo.start_time)
                 do_kill = confirm('Do you want to preempt {}:{} on gpu {}?'.format(
                     user_to_boot, process_to_preempt.pid, process_to_preempt.gpu_index
                 ))
@@ -232,7 +240,7 @@ def main():
                         print("{}:{} subprocesses no longer running; attempting to launch".format(
                             user_to_boot, process_to_preempt.pid
                         ))
-                        try_launch()
+                        try_launch(args, lock_directory)
                     else:
                         print("waited {} seconds after kill signal but {}:{} {} is still running; consider manually preempting".format(
                             args.preempt_wait_time, user_to_boot, process_to_preempt.pid, still_running
