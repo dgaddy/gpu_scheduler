@@ -8,7 +8,7 @@ from datetime import datetime
 import random
 import time
 
-lock_base_directory = './locks'
+lock_base_directory = '/shared/group/gpu_scheduler/locks'
 
 MINIMUM_PRIVELIGED_JOBS = 1
 MINIMUM_NON_PRIVELIGED_JOBS = 0
@@ -111,7 +111,7 @@ def kill_process(pid, max_wait_time=0, recursive=True, signal=15):
 
 def get_locking_pid(lock_filename):
     # note actually returns process accessing the file, not just locking
-    result = subprocess.run(['lsof','-t',lock_filename], stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='ascii')
+    result = subprocess.run('sudo lsof -t '+lock_filename, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='ascii')
     result_list = result.stdout.strip().split()
     if len(result_list) > 1:
         print('Warning: mutliple processes accessing lock file')
@@ -129,8 +129,8 @@ def lock_and_run(lock_filename, command, env={}):
 
         try:
             print('Running command:', command)
-            if len(env) > 0:
-                print('Env:', env)
+            if 'CUDA_VISIBLE_DEVICES' in env:
+                print('GPU(s):', env['CUDA_VISIBLE_DEVICES'])
             result = subprocess.run(command, shell=True, env=env)
             return True
         finally:
@@ -148,17 +148,14 @@ def confirm(prompt):
 def make_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--large-mem', action='store_true', help="request gpu with extra memory")
-    parser.add_argument('--inherit-environment', action='store_true', help="pass the current environment variables to the command")
+    parser.add_argument('--no-inherit-environment', action='store_true', help="don't pass the current environment variables to the command")
     parser.add_argument('--preempt-wait-time', type=int, default=10, help='wait this many seconds for a preempted process to exit')
     parser.add_argument('command', nargs='*', help="command to run")
     return parser
 
 def main():
     args = make_arg_parser().parse_args()
-    print(args, args.command)
     lock_directory = os.path.join(lock_base_directory, get_hostname())
-    def get_lock_filename(index):
-        return os.path.join(lock_directory, 'gpu{}'.format(index))
     user = get_username()
 
     with open(os.path.join(lock_directory, 'privileged_users'), 'r') as f:
@@ -179,17 +176,17 @@ def main():
                 continue
             elif not args.large_mem and '8000' in gpu_info.name:
                 continue
-            fn = get_lock_filename(gpu_info.index)
+            fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
             used_by = get_locking_pid(fn)
             while used_by is None:
                 if len(gpu_processes[gpu]) > 0:
                     process_infos = ' '.join(['{}:{}'.format(pid, process_users[pid]) for pid in gpu_processes[gpu]])
                     print('Warning: processes with no reservation on gpu {} - {}'.format(gpu_info.index, process_infos))
 
-                if args.inherit_environment:
-                    env = os.environ
-                else:
+                if args.no_inherit_environment:
                     env = {}
+                else:
+                    env = os.environ
 
                 env['CUDA_VISIBLE_DEVICES'] = gpu_info.index
 
