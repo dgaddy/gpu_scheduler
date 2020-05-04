@@ -216,8 +216,7 @@ def main():
         for user, procs in reserved_processes_by_user.items()
     }
     print('Users with a reservation:', user_reservation_counts)
-    #if user in privileged_users and user not in user_reservation_counts:
-    if user in privileged_users:
+    if user in privileged_users and user not in user_reservation_counts:
         reserved = list(reserved_processes_by_user.items())
         # shuffle before sorting to break ties non-deterministically
         random.shuffle(reserved)
