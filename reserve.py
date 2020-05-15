@@ -136,7 +136,7 @@ def lock_and_run(lock_filename, command, env={}):
                 while True:
                     returned = process.wait()
                     if returned is None:
-                        time.sleep(5)
+                        time.sleep(1)
                     else:
                         break
             except KeyboardInterrupt:
