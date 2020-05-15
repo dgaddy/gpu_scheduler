@@ -131,7 +131,24 @@ def lock_and_run(lock_filename, command, env={}):
             print('Running command:', command)
             if 'CUDA_VISIBLE_DEVICES' in env:
                 print('GPU(s):', env['CUDA_VISIBLE_DEVICES'])
-            result = subprocess.run(command, shell=True, env=env)
+
+            # If we used subprocess.run, Ctrl-C (keyboard interrupt) is not passed to
+            # the subprocess, so run in a polling loop and catch the interrupt.
+            process = subprocess.Popen(command, shell=True, env=env)
+            try:
+                while True:
+                    returned = process.wait()
+                    if returned is None:
+                        time.sleep(1)
+                    else:
+                        break
+            except KeyboardInterrupt:
+                # hack: for some reason, kill_process(str(process.pid)) does not 
+                # actually kill all subprocess, so kill this process instead (in the same
+                # way it would be killed by another invocation of reserve.py).
+                # The finally exception below will still be invoked, releasing the lock.
+                print("Ctrl+C caught, sending kill to this process and its subprocesses")
+                kill_process(str(os.getpid()))
             return True
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
