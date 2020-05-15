@@ -131,7 +131,17 @@ def lock_and_run(lock_filename, command, env={}):
             print('Running command:', command)
             if 'CUDA_VISIBLE_DEVICES' in env:
                 print('GPU(s):', env['CUDA_VISIBLE_DEVICES'])
-            result = subprocess.run(command, shell=True, env=env)
+            process = subprocess.Popen(command, shell=True, env=env)
+            try:
+                while True:
+                    returned = process.wait()
+                    if returned is None:
+                        time.sleep(5)
+                    else:
+                        break
+            except KeyboardInterrupt:
+                print("Ctrl+C caught, sending kill to this process and its subprocesses")
+                kill_process(str(os.getpid()))
             return True
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
