@@ -7,6 +7,7 @@ from collections import namedtuple, defaultdict, Counter
 from datetime import datetime
 import random
 import time
+from contextlib import ExitStack
 
 lock_base_directory = '/shared/group/gpu_scheduler/locks'
 
@@ -120,39 +121,38 @@ def get_locking_pid(lock_filename):
     else:
         return result_list[0]
 
-def lock_and_run(lock_filename, command, env={}):
-    with open(lock_filename, 'wb') as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except:
-            return False # failed to aquire lock
-
-        try:
-            print('Running command:', command)
-            if 'CUDA_VISIBLE_DEVICES' in env:
-                print('GPU(s):', env['CUDA_VISIBLE_DEVICES'])
-
-            # If we used subprocess.run, Ctrl-C (keyboard interrupt) is not passed to
-            # the subprocess, so run in a polling loop and catch the interrupt.
-            process = subprocess.Popen(command, shell=True, env=env)
+def lock_and_run(lock_filenames, command, env={}):
+    with ExitStack() as stack:
+        for filename in lock_filenames:
+            f = stack.enter_context(open(filename, 'wb'))
             try:
-                while True:
-                    returned = process.wait()
-                    if returned is None:
-                        time.sleep(1)
-                    else:
-                        break
-            except KeyboardInterrupt:
-                # hack: for some reason, kill_process(str(process.pid)) does not 
-                # actually kill all subprocess, so kill this process instead (in the same
-                # way it would be killed by another invocation of reserve.py).
-                # The finally exception below will still be invoked, releasing the lock.
-                print("Ctrl+C caught, sending kill to this process and its subprocesses")
-                kill_process(str(os.getpid()))
-            return True
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-            # note that worst case the lock is released when this process dies
+                fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)
+                # the lock is released when the file is closed (or worst case when this process dies)
+            except:
+                return False, f # failed to aquire lock
+
+        print('Running command:', command)
+        if 'CUDA_VISIBLE_DEVICES' in env:
+            print('GPU(s):', env['CUDA_VISIBLE_DEVICES'])
+
+        # If we used subprocess.run, Ctrl-C (keyboard interrupt) is not passed to
+        # the subprocess, so run in a polling loop and catch the interrupt.
+        process = subprocess.Popen(command, shell=True, env=env)
+        try:
+            while True:
+                returned = process.wait()
+                if returned is None:
+                    time.sleep(1)
+                else:
+                    break
+        except KeyboardInterrupt:
+            # hack: for some reason, kill_process(str(process.pid)) does not 
+            # actually kill all subprocess, so kill this process instead (in the same
+            # way it would be killed by another invocation of reserve.py).
+            # The finally exception below will still be invoked, releasing the lock.
+            print("Ctrl+C caught, sending kill to this process and its subprocesses")
+            kill_process(str(os.getpid()))
+        return True, None
 
 def confirm(prompt):
     print(prompt, end='')
@@ -165,6 +165,7 @@ def confirm(prompt):
 def make_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--large-mem', action='store_true', help="request gpu with extra memory")
+    parser.add_argument('--num-gpus', type=int, default=1, help='number of gpus to reserve')
     parser.add_argument('--no-inherit-environment', action='store_true', help="don't pass the current environment variables to the command")
     parser.add_argument('--preempt-wait-time', type=int, default=10, help='wait this many seconds for a preempted process to exit')
     parser.add_argument('command', nargs='*', help="command to run")
@@ -180,33 +181,23 @@ def try_launch(args, lock_directory):
 
     reserved_processes_by_user = defaultdict(list)
 
+    available_gpu_locks = {} # lock_file : gpu_index
+
     for gpu, gpu_info in gpus.items():
         can_run = ((args.large_mem and '8000' in gpu_info.name) or 
                     (not args.large_mem and '8000' not in gpu_info.name))
         fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
         used_by = get_locking_pid(fn)
-        if can_run:
-            while used_by is None:
-                if len(gpu_processes[gpu]) > 0:
-                    process_infos = ' '.join(['{}:{}'.format(pid, process_users[pid]) for pid in gpu_processes[gpu]])
-                    print('Warning: processes with no reservation on gpu {} - {}'.format(gpu_info.index, process_infos))
+        if used_by is None and len(gpu_processes[gpu]) > 0:
+            # process is using without a reservation
+            process_infos = ' '.join(['{}:{}'.format(pid, process_users[pid]) for pid in gpu_processes[gpu]])
+            print('Warning: processes with no reservation on gpu {} - {}'.format(gpu_info.index, process_infos))
+            used_by = gpu_processes[gpu][0]
 
-                if args.no_inherit_environment:
-                    env = {}
-                else:
-                    env = os.environ
-
-                env['CUDA_VISIBLE_DEVICES'] = gpu_info.index
-
-                success = lock_and_run(fn, ' '.join(args.command), env)
-
-                if success:
-                    sys.exit(0)
-                else:
-                    print('Failed to aquire lock on gpu', gpu_info.index)
-                used_by = get_locking_pid(fn)
-
-        if used_by is not None:
+        if used_by is None:
+            if can_run:
+                available_gpu_locks[fn] = gpu_info.index
+        else:
             reserved_processes_by_user[process_users[used_by]].append(ProcInfo(
                 pid=used_by,
                 user=process_users[used_by],
@@ -214,6 +205,25 @@ def try_launch(args, lock_directory):
                 start_time=all_start_times[used_by],
                 preemption_candidate=can_run,
             ))
+
+    while len(available_gpu_locks) > args.num_gpus:
+        if args.no_inherit_environment:
+            env = {}
+        else:
+            env = os.environ
+
+        files_to_lock = list(available_gpu_locks.keys())[:args.num_gpus]
+        env['CUDA_VISIBLE_DEVICES'] = ','.join(available_gpu_locks[f] for f in files_to_lock)
+
+        success, blocking_file = lock_and_run(files_to_lock, ' '.join(args.command), env)
+
+        if success:
+            sys.exit(0)
+        else:
+            print('Failed to aquire lock on', blocking_file)
+            del available_gpu_locks[blocking_file]
+            #TODO: add to reserved_processes_by_user
+
     return reserved_processes_by_user
 
 def main():
@@ -236,12 +246,11 @@ def main():
     }
     print('Users with a reservation:', user_reservation_counts)
     print('Users with a reservation on usable gpus:', user_reservation_counts_usable)
-    if user in privileged_users and user not in user_reservation_counts_usable:
-    #if user in privileged_users:
+    if user in privileged_users and user not in user_reservation_counts_usable and args.num_gpus == 1:
         reserved = list(reserved_processes_by_user.items())
         # shuffle before sorting to break ties non-deterministically
         random.shuffle(reserved)
-        for user_to_boot, users_processes in sorted(reserved, key=lambda tpl: len(tpl[1])):
+        for user_to_boot, users_processes in sorted(reserved, key=lambda tpl: len(tpl[1]), reverse=True):
             preemption_candidates = [proc_info for proc_info in users_processes if proc_info.preemption_candidate]
             over_minimum = ((user_to_boot in privileged_users and len(users_processes) > MINIMUM_PRIVELIGED_JOBS) or
                             (user_to_boot not in privileged_users and len(users_processes) > MINIMUM_NON_PRIVELIGED_JOBS))
