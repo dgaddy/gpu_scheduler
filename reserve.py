@@ -8,6 +8,7 @@ from datetime import datetime
 import random
 import time
 from contextlib import ExitStack
+import pprint
 
 lock_base_directory = '/shared/group/gpu_scheduler/locks'
 
@@ -206,7 +207,7 @@ def try_launch(args, lock_directory):
                 preemption_candidate=can_run,
             ))
 
-    while len(available_gpu_locks) > args.num_gpus:
+    while len(available_gpu_locks) >= args.num_gpus:
         if args.no_inherit_environment:
             env = {}
         else:
@@ -246,6 +247,12 @@ def main():
     }
     print('Users with a reservation:', user_reservation_counts)
     print('Users with a reservation on usable gpus:', user_reservation_counts_usable)
+    # by_gpu = defaultdict(list)
+    # for user, procs in reserved_processes_by_user.items():
+    #     for proc in procs:
+    #         by_gpu[proc.gpu_index].append((user, proc))
+    # pprint.pprint(by_gpu)
+
     if user in privileged_users and user not in user_reservation_counts_usable and args.num_gpus == 1:
         reserved = list(reserved_processes_by_user.items())
         # shuffle before sorting to break ties non-deterministically
