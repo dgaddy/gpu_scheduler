@@ -130,7 +130,7 @@ def lock_and_run(lock_filenames, command, env={}):
                 fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)
                 # the lock is released when the file is closed (or worst case when this process dies)
             except:
-                return False, f # failed to aquire lock
+                return False, filename # failed to aquire lock
 
         print('Running command:', command)
         if 'CUDA_VISIBLE_DEVICES' in env:
@@ -175,37 +175,15 @@ def make_arg_parser():
 def try_launch(args, lock_directory):
     gpus = get_gpu_infos()
     gpu_processes = get_gpu_processes()
-    process_users = get_process_users()
-
-    users_with_reservation = []
-    all_start_times = get_process_starts()
-
-    reserved_processes_by_user = defaultdict(list)
 
     available_gpu_locks = {} # lock_file : gpu_index
 
     for gpu, gpu_info in gpus.items():
         can_run = ((args.large_mem and '8000' in gpu_info.name) or 
                     (not args.large_mem and '8000' not in gpu_info.name))
-        fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
-        used_by = get_locking_pid(fn)
-        if used_by is None and len(gpu_processes[gpu]) > 0:
-            # process is using without a reservation
-            process_infos = ' '.join(['{}:{}'.format(pid, process_users[pid]) for pid in gpu_processes[gpu]])
-            print('Warning: processes with no reservation on gpu {} - {}'.format(gpu_info.index, process_infos))
-            used_by = gpu_processes[gpu][0]
-
-        if used_by is None:
-            if can_run:
-                available_gpu_locks[fn] = gpu_info.index
-        else:
-            reserved_processes_by_user[process_users[used_by]].append(ProcInfo(
-                pid=used_by,
-                user=process_users[used_by],
-                gpu_index=gpu_info.index,
-                start_time=all_start_times[used_by],
-                preemption_candidate=can_run,
-            ))
+        if can_run and len(gpu_processes[gpu]) == 0:
+            fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
+            available_gpu_locks[fn] = gpu_info.index
 
     while len(available_gpu_locks) >= args.num_gpus:
         if args.no_inherit_environment:
@@ -221,9 +199,31 @@ def try_launch(args, lock_directory):
         if success:
             sys.exit(0)
         else:
-            print('Failed to aquire lock on', blocking_file)
             del available_gpu_locks[blocking_file]
-            #TODO: add to reserved_processes_by_user
+
+    process_users = get_process_users()
+    all_start_times = get_process_starts()
+    reserved_processes_by_user = defaultdict(list)
+
+    for gpu, gpu_info in gpus.items():
+        can_run = ((args.large_mem and '8000' in gpu_info.name) or 
+                    (not args.large_mem and '8000' not in gpu_info.name))
+        fn = os.path.join(lock_directory, 'gpu{}'.format(gpu_info.index))
+        used_by = get_locking_pid(fn)
+        if used_by is None and len(gpu_processes[gpu]) > 0:
+            # process is using without a reservation
+            process_infos = ' '.join(['{}:{}'.format(pid, process_users[pid]) for pid in gpu_processes[gpu]])
+            print('Warning: processes with no reservation on gpu {} - {}'.format(gpu_info.index, process_infos))
+            used_by = gpu_processes[gpu][0]
+
+        if used_by is not None:
+            reserved_processes_by_user[process_users[used_by]].append(ProcInfo(
+                pid=used_by,
+                user=process_users[used_by],
+                gpu_index=gpu_info.index,
+                start_time=all_start_times[used_by],
+                preemption_candidate=can_run,
+            ))
 
     return reserved_processes_by_user
 
