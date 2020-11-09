@@ -39,13 +39,15 @@ def get_gpu_infos():
 
 def get_gpu_processes():
     # use `nividi-smi --help-query-compute-apps` to get all query options
-    result = subprocess.run(['nvidia-smi','--query-compute-apps=pid,gpu_uuid','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
+    result = subprocess.run(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,name','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
     gpu_processes = defaultdict(list)
     for line in result.stdout.split('\n'):
         if len(line) == 0:
             continue
-        pid, gpu_uuid = [v.strip() for v in line.split(',')]
-        gpu_processes[gpu_uuid].append(pid)
+        pid, gpu_uuid, name = [v.strip() for v in line.split(',')]
+        # apparently sometimes nvidia-smi will return pids that are not running. these can be identified by name=='[Not Found]'
+        if name != '[Not Found]':
+            gpu_processes[gpu_uuid].append(pid)
     return gpu_processes
 
 def get_process_stats(field):
