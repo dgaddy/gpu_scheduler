@@ -9,6 +9,7 @@ import random
 import time
 from contextlib import ExitStack
 import pprint
+import re
 
 lock_base_directory = '/shared/group/gpu_scheduler/locks'
 
@@ -28,26 +29,34 @@ ProcInfo = namedtuple('ProcInfo', ['pid', 'user', 'gpu_index', 'start_time', 'pr
 
 def get_gpu_infos():
     # use `nvidia-smi --help-query-gpu` to get all query options
-    result = subprocess.run(['nvidia-smi','--query-gpu=gpu_uuid,index,name','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
+    #result = subprocess.run(['nvidia-smi','--query-gpu=gpu_uuid,index,name','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
+    result = subprocess.run(['nvidia-smi', '-L'], stdout=subprocess.PIPE, encoding='ascii')
+    parse_exp = re.compile(r'GPU (\d+): (.*) \(UUID: (.*)\)')
     gpu_infos = {}
     for line in result.stdout.split('\n'):
         if len(line) == 0:
             continue
-        gpu_uuid, index, name = [v.strip() for v in line.split(',')]
+        match = parse_exp.match(line)
+        if not match:
+            continue
+        index, name, gpu_uuid = match.groups()
+        #gpu_uuid, index, name = [v.strip() for v in line.split(',')]
         gpu_infos[gpu_uuid] = GPUInfo(index, name)
     return gpu_infos
 
-def get_gpu_processes():
+def get_gpu_processes(device_numbers):
     # use `nividi-smi --help-query-compute-apps` to get all query options
-    result = subprocess.run(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,name','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
     gpu_processes = defaultdict(list)
-    for line in result.stdout.split('\n'):
-        if len(line) == 0:
-            continue
-        pid, gpu_uuid, name = [v.strip() for v in line.split(',')]
-        # apparently sometimes nvidia-smi will return pids that are not running. these can be identified by name=='[Not Found]'
-        if name != '[Not Found]':
-            gpu_processes[gpu_uuid].append(pid)
+    for device_number in device_numbers:
+        print(device_number)
+        result = subprocess.run(['nvidia-smi','-i', str(device_number), '--query-compute-apps=pid,gpu_uuid,name','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
+        for line in result.stdout.split('\n'):
+            if len(line) == 0:
+                continue
+            pid, gpu_uuid, name = [v.strip() for v in line.split(',')]
+            # apparently sometimes nvidia-smi will return pids that are not running. these can be identified by name=='[Not Found]'
+            if name != '[Not Found]':
+                gpu_processes[gpu_uuid].append(pid)
     return gpu_processes
 
 def get_process_stats(field):
@@ -176,7 +185,8 @@ def make_arg_parser():
 
 def try_launch(args, lock_directory):
     gpus = get_gpu_infos()
-    gpu_processes = get_gpu_processes()
+    gpu_numbers = [gpu.index for gpu in gpus.values()]
+    gpu_processes = get_gpu_processes(gpu_numbers)
 
     available_gpu_locks = {} # lock_file : gpu_index
 
