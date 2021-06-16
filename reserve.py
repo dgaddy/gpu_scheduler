@@ -48,7 +48,6 @@ def get_gpu_processes(device_numbers):
     # use `nividi-smi --help-query-compute-apps` to get all query options
     gpu_processes = defaultdict(list)
     for device_number in device_numbers:
-        print(device_number)
         result = subprocess.run(['nvidia-smi','-i', str(device_number), '--query-compute-apps=pid,gpu_uuid,name','--format=csv,noheader,nounits'], stdout=subprocess.PIPE, encoding='ascii')
         for line in result.stdout.split('\n'):
             if len(line) == 0:
@@ -127,7 +126,7 @@ def get_locking_pid(lock_filename):
     result = subprocess.run('sudo lsof -t '+lock_filename, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='ascii')
     result_list = result.stdout.strip().split()
     if len(result_list) > 1:
-        print('Warning: mutliple processes accessing lock file')
+        print('Warning: multiple processes accessing lock file')
     if len(result_list) == 0:
         return None
     else:
